@@ -155,3 +155,66 @@ def residual_writers():
     b.append(_t(380, 198, "That is exactly what the inference hook x ← x − (x·d)d enforces after every layer.",
                 "middle", 11.5, "muted"))
     return _svg(770, 210, "".join(b), "Residual stream writers that get orthogonalised")
+
+
+def qwen_arch():
+    """Qwen3.8-27B layer layout (left) and one Gated DeltaNet mixer (right). Drawn from the model's config.json and
+    mlx-lm's qwen3_5.py, not copied from any published figure."""
+    b = [DEFS]
+    W, H = 860, 470
+    # ---- left: the stack
+    b.append(_t(150, 20, "Qwen3.8-27B: 64 layers, hidden 5120", "middle", 13, "ink", "700"))
+    b.append(box(40, 400, 220, 40, "Token embedding", "vocab 248k → 5120"))
+    b.append(arrow(150, 400, 150, 378))
+    b.append('<rect x="24" y="168" width="252" height="206" rx="10" class="band"/>')
+    b.append(_t(298, 278, "× 16", "middle", 15, "accent", "700"))
+    rows = [("Gated DeltaNet", "box hl"), ("Gated DeltaNet", "box hl"), ("Gated DeltaNet", "box hl"),
+            ("Gated attention", "box")]
+    for i, (name, cls) in enumerate(reversed(rows)):
+        y = 200 + i * 42
+        b.append(f'<rect x="40" y="{y}" width="150" height="34" rx="7" class="{cls}"/>')
+        b.append(_t(115, y + 21, name, "middle", 12, "ink", "600"))
+        b.append(f'<rect x="196" y="{y}" width="56" height="34" rx="7" class="box"/>')
+        b.append(_t(224, y + 21, "MLP", "middle", 12, "ink", "600"))
+    b.append(_t(150, 186, "x += mixer(norm x); x += MLP(norm x)", "middle", 10.5, "muted"))
+    b.append(arrow(150, 168, 150, 148))
+    b.append(box(40, 104, 220, 40, "RMSNorm → LM head", "5120 → 248k logits"))
+    b.append(_t(150, 62, "48 × Gated DeltaNet (linear attention)", "middle", 11.5, "accent", "600"))
+    b.append(_t(150, 78, "16 × gated full attention: 24 Q / 4 KV heads, dim 256", "middle", 11, "muted"))
+    b.append(_t(150, 93, "MLP: SwiGLU 5120 → 17408 → 5120 (dense)", "middle", 11, "muted"))
+    # zoom line
+    # ---- right: one Gated DeltaNet mixer
+    X0 = 320
+    b.append(f'<rect x="{X0}" y="34" width="528" height="424" rx="10" class="box"/>')
+    b.append(_t(X0 + 264, 56, "One Gated DeltaNet layer", "middle", 13, "ink", "700"))
+    b.append(box(X0 + 184, 68, 160, 30, "input x (5120)"))
+    px = [X0 + 16, X0 + 186, X0 + 300, X0 + 414]
+    pn = [("in_proj_qkv", 160), ("in_proj_a", 100), ("in_proj_b", 100), ("in_proj_z", 100)]
+    for x, (n, w) in zip(px, pn):
+        b.append(box(x, 118, w, 30, n))
+        b.append(arrow(X0 + 264, 98, x + w / 2, 114, "arrow thin"))
+    b.append(box(X0 + 16, 166, 160, 44, "causal conv1d, k = 4", "+ SiLU (local mixing)"))
+    b.append(arrow(X0 + 96, 148, X0 + 96, 162, "arrow thin"))
+    b.append(box(X0 + 16, 228, 160, 50, "q, k: 16 heads × 128", "L2-normalised; v: 48 × 128"))
+    b.append(arrow(X0 + 96, 210, X0 + 96, 224, "arrow thin"))
+    b.append(box(X0 + 186, 166, 100, 44, "decay α_t", "exp(−e^A·softplus)"))
+    b.append(box(X0 + 300, 166, 100, 44, "write β_t", "sigmoid(b)"))
+    b.append(arrow(X0 + 236, 148, X0 + 236, 162, "arrow thin"))
+    b.append(arrow(X0 + 350, 148, X0 + 350, 162, "arrow thin"))
+    # recurrence
+    b.append(f'<rect x="{X0 + 16}" y="296" width="384" height="78" rx="8" class="box hl"/>')
+    b.append(_t(X0 + 208, 318, "delta-rule state update, per value head", "middle", 12.5, "ink", "600"))
+    b.append(_t(X0 + 208, 340, "S_t = α_t · S_{t−1} (I − β_t k_t k_tᵀ) + β_t v_t k_tᵀ", "middle", 12.5, "accent", "600"))
+    b.append(_t(X0 + 208, 361, "o_t = S_t q_t     state S: 48 × 128 × 128, fixed size", "middle", 11, "muted"))
+    b.append(arrow(X0 + 96, 278, X0 + 96, 292, "arrow thin"))
+    b.append(arrow(X0 + 236, 210, X0 + 236, 292, "arrow thin"))
+    b.append(arrow(X0 + 350, 210, X0 + 350, 292, "arrow thin"))
+    b.append(box(X0 + 16, 392, 384, 30, "RMSNorm(o) · SiLU(z)  →  out_proj (6144 → 5120)"))
+    b.append(arrow(X0 + 208, 374, X0 + 208, 388, "arrow thin"))
+    b.append(f'<path d="M{X0 + 464},148 L{X0 + 464},407 L{X0 + 404},407" fill="none" class="arrow thin" '
+             f'marker-end="url(#ah)"/>')
+    b.append(_t(X0 + 470, 280, "output gate z", size=10.5, cls="muted",
+                extra=f'transform="rotate(90 {X0 + 470} 280)"'))
+    b.append(_t(X0 + 16, 444, "training: the recurrence over t is the part with no backward kernel in mlx-lm",
+                size=10.5, cls="bad", weight="600"))
+    return _svg(W, H, "".join(b), "Qwen3.8-27B architecture and one Gated DeltaNet layer")

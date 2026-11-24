@@ -105,3 +105,33 @@ def hbars(rows, label, w=720, unit="×", ref=None, maxv=None, color="--c1"):
             y += bh + gap
         y += ggap
     return _svg(w, h, "".join(b), label)
+
+
+def paired_bars(rows, series, label, unit, w=720, maxv=None, missing="OOM", note=""):
+    """rows: [(name, (a, b))] — two horizontal bars per row (series[0] / series[1]); None draws `missing`."""
+    left, right, top, bh, gap, rgap = 200, 70, 34, 14, 3, 14
+    h = top + len(rows) * (2 * bh + gap + rgap) + (24 if note else 8)
+    maxv = maxv or max(v for _, vs in rows for v in vs if isinstance(v, (int, float))) * 1.08
+    pw = w - left - right
+    X = lambda v: left + pw * v / maxv
+    cols = [c for _, c in series]
+    b, x = [], left
+    for name, col in series:
+        b.append(f'<rect x="{x}" y="8" width="12" height="12" rx="2" fill="var({col})"/>')
+        b.append(_t(x + 17, 18, name, size=12, cls="muted"))
+        x += 40 + 6.8 * len(name)
+    y = top
+    for name, vals in rows:
+        b.append(_t(left - 10, y + bh + gap / 2 + 4, name, "end", 12.5))
+        for v, col in zip(vals, cols):
+            if v is None or isinstance(v, str):
+                b.append(f'<rect x="{left}" y="{y}" width="3" height="{bh}" fill="var(--bad)"/>')
+                b.append(_t(left + 8, y + bh - 3, v or missing, size=11.5, cls="bad", weight="600"))
+            else:
+                b.append(f'<rect x="{left}" y="{y}" width="{X(v) - left:.1f}" height="{bh}" rx="2" fill="var({col})"/>')
+                b.append(_t(X(v) + 6, y + bh - 3, f"{v:g} {unit}", size=11.5, weight="600"))
+            y += bh + gap
+        y += rgap - gap
+    if note:
+        b.append(_t(left, h - 6, note, size=11, cls="muted"))
+    return _svg(w, h, "".join(b), label)

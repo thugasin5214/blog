@@ -27,6 +27,15 @@ RDCU = [("Base model", [43, 0, 23, 0]), ("LoRA step 150", [16, 11, 37, 2]), ("Ab
         ("LoRA + ablation", [1, 18, 37, 10]), ("DPO β=0.1", [2, 7, 49, 8]), ("DPO β=0.3", [9, 6, 43, 8])]
 MEM = [(512, 4.8), (1024, 14.9), (2048, 52.6)]          # 0.8B, real MLX peak GB
 MEM_FP = [(512, 8.8), (1024, 25.6), (2048, 70.4)]       # process footprint incl. allocator cache
+# 27B fused gated-delta kernel (unsloth-zoo [21]) vs the ops path; batch 1, grad checkpoint, MLX real peak
+GDN_ROWS = [("SFT 1024, 8 LoRA layers", (39, 102), (58.2, 17.3)),
+            ("SFT 1024, 16 LoRA layers", (25, 81), (58.5, 17.7)),
+            ("SFT variable length, 8 layers", (80, 162), (56.0, 17.3)),
+            ("SFT 2048, 8 layers", ("OOM", 133), ("OOM", 18.8)),
+            ("SFT 4096, 8 layers", ("not run", 132), ("not run", 21.9)),
+            ("SFT 8192, 8 layers", ("not run", 134), ("not run", 27.5)),
+            ("DPO 1024, 8 layers", (70, 102), (34.8, 19.0))]
+GDN_LOSS = {"ops": [(2, 2.382), (4, 1.722), (6, 2.135)], "kernel": [(2, 2.383), (4, 1.722), (6, 2.135)]}
 DFLASH = [("block 3, 4-bit draft", [("fiction", 1.04), ("scripts", 1.38), ("Q&A", 1.66)]),
           ("block 5 (recommended)", [("fiction", 0.74), ("scripts", 1.05), ("Q&A", 1.44)]),
           ("block 8 (vendor setting)", [("fiction", 0.48), ("scripts", 0.77), ("Q&A", 1.00)]),
@@ -36,12 +45,22 @@ DFLASH = [("block 3, 4-bit draft", [("fiction", 1.04), ("scripts", 1.38), ("Q&A"
 def figs():
     f = {}
     f["pipeline"] = D.pipeline()
+    f["arch"] = D.qwen_arch()
     f["patch"] = D.layer_patch()
     f["mem"] = C.line_chart(
         [("real peak (mx.get_peak_memory)", "--c1", MEM, False), ("process footprint (incl. cache)", "--c3", MEM_FP, True)],
         "Peak memory vs sequence length, 0.8B model", "sequence length T (tokens, log scale)", "GB (log scale)",
         (400, 2600), (3, 100), logx=True, logy=True, xticks=[512, 1024, 2048], yticks=[5, 10, 20, 50, 100],
         points=True, h=280)
+    gdn_series = [("ops path (frozen-layer patch only)", "--c3"), ("+ fused backward kernel", "--c1")]
+    f["gdn_speed"] = C.paired_bars([(n, s) for n, s, _ in GDN_ROWS], gdn_series,
+                                   "Training throughput on 27B, ops path vs fused kernel", "tok/s")
+    f["gdn_mem"] = C.paired_bars([(n, m) for n, _, m in GDN_ROWS], gdn_series,
+                                 "Real peak memory on 27B, ops path vs fused kernel", "GB")
+    f["gdn_loss"] = C.line_chart(
+        [("fused kernel", "--c1", GDN_LOSS["kernel"], False), ("ops path (dashed, drawn on top)", "--c3", GDN_LOSS["ops"], True)],
+        "Training loss, ops path vs fused kernel, same data and seed", "step", "train loss",
+        (1.5, 6.5), (1.5, 2.6), xticks=[2, 4, 6], yticks=[1.6, 1.8, 2.0, 2.2, 2.4], points=True, h=230)
     f["cos"] = C.line_chart(
         [("cos(r_target, r_harm)", "--c1", list(enumerate(COS)), False)],
         "Cosine between the target-category and general-harm directions per layer", "layer", "cosine",
@@ -71,6 +90,17 @@ def fig(svg, caption, n):
 
 def post_body(F):
     return f"""
+<p>I&rsquo;m a strong believer in open-weight models. As LLMs get more capable, safety and alignment matter
+more and more. So does personal privacy, even though there&rsquo;s very little of it left. A model running on my
+own machine is the last place where I can share anything without wondering who else might end up using my data.</p>
+
+<p>Local models still can&rsquo;t match frontier models in general capability. For a specific task, though,
+they&rsquo;re often good enough. When they aren&rsquo;t, you need a way to train them until they do what you expect.
+That&rsquo;s what I love about open source: I can see how everything works, and I can retrain the model for what I
+need. I want a model that works for me, not for someone else&rsquo;s policy. So I spent a few weeks finding out how
+far I could move a local Qwen3.8-27B away from refusing one specific category of requests. I also wanted to see
+what that costs in quality and in the safety behaviour I wanted to keep.</p>
+
 <p class="lede">This is a write-up of a few weeks of post-training a 27-billion-parameter model on a single Mac
 (M4 Max, 128&nbsp;GB unified memory) with nothing but the open-source MLX stack. The goal was narrow:
 make the model stop refusing <em>one specific content category</em> while it keeps refusing everything else,
@@ -83,7 +113,8 @@ less about the goal and more about what broke along the way.</p>
 <li><b>Training a hybrid linear-attention model in MLX is slow for a fixable reason.</b> mlx-lm drops every
 Gated DeltaNet layer into a per-token Python loop in training mode, frozen layers included. A ~60-line patch keeps
 frozen layers on the Metal kernel: 32 → 61 tok/s. It does <em>not</em> save memory (I first thought it did; it was
-allocator cache).</li>
+allocator cache). Swapping unsloth-zoo&rsquo;s fused backward kernel into the LoRA layers does: 102 tok/s at
+17&nbsp;GB instead of 58&nbsp;GB, and sequence 8192 now trains in 27.5&nbsp;GB, with identical loss.</li>
 <li><b>Refusing and deflecting are different behaviours.</b> Stacking LoRA SFT with refusal-direction ablation took
 explicit refusals from 43/66 to 1/66, yet the comply rate did not move (56%): the refusals turned into
 "sure!"-and-then-write-something-else. Only DPO on the model's own deflections reduced them.</li>
@@ -106,7 +137,7 @@ refused. I refer to the target simply as <b>the target category</b> from here on
 <ol>
 <li><a href="#setup">Setup and constraints</a></li>
 <li><a href="#infra">Training Gated DeltaNet in MLX</a></li>
-<li><a href="#memory">Memory: a self-correction</a></li>
+<li><a href="#memory">Memory: a self-correction, then the real fix</a></li>
 <li><a href="#eval">What counts as "not refusing"?</a></li>
 <li><a href="#sft">SFT: the loss barely moves</a></li>
 <li><a href="#ablation">A category-specific refusal direction</a></li>
@@ -146,6 +177,24 @@ loss on the response only.</li>
 </ul>
 
 <h2 id="infra">2. Training Gated DeltaNet in MLX</h2>
+<h3>2.1 What Gated DeltaNet is</h3>
+<p>A standard attention layer keeps every past key and value (the KV cache) and compares each new query with all of
+them, so cost and memory grow with context length. Linear attention replaces the cache with a fixed-size matrix
+\\(S\\) per head, a running memory that maps keys to values: reading is \\(o_t = S_t q_t\\), and writing adds
+\\(v_t k_t^\\top\\). Decoding then costs the same at token 100 and at token 100,000.</p>
+<p>Plain additive writes pile up and blur, though. Gated DeltaNet <a href="#r10">[10]</a> fixes this with two ideas.
+The <b>delta rule</b> first reads what \\(S\\) currently stores under \\(k_t\\), then writes only the correction
+\\(\\beta_t (v_t - S k_t)\\), so a key that is reused gets overwritten instead of accumulated. The <b>gate</b>
+\\(\\alpha_t \\in (0, 1)\\), computed per token and per head, lets the layer decay old memory quickly (a topic change)
+or keep it (a long quote). Both \\(\\alpha_t\\) and the write strength \\(\\beta_t\\) come from small projections of the
+input, and a width-4 causal convolution in front gives \\(q, k, v\\) some local context.</p>
+<p>A fixed-size memory is lossy, so it is weak at exact recall over long distances. Qwen3.8 therefore interleaves:
+three Gated DeltaNet layers, then one full (gated) attention layer, repeated 16 times.</p>
+{fig(F["arch"], "Qwen3.8-27B, drawn from its <code>config.json</code> and mlx-lm&rsquo;s <code>qwen3_5.py</code>. "
+     "Left: 64 layers in 16 groups of three Gated DeltaNet layers plus one gated full-attention layer, each followed "
+     "by a dense SwiGLU MLP. Right: one Gated DeltaNet mixer. Keys and queries have 16 heads; values have 48, so "
+     "three value heads share each key head. The state is 48 × 128 × 128 per layer regardless of context length.", 2)}
+<h3>2.2 Why it trains slowly in MLX</h3>
 <p>The first 27B run (sequence 2048, 16 LoRA layers) died on step one with a Metal OOM at 122&nbsp;GB — for a 16&nbsp;GB
 model. The cause is one line in mlx-lm's <code>qwen3_5.py</code>:</p>
 <pre><code>out, state = gated_delta_update(..., use_kernel=not self.training)</code></pre>
@@ -157,7 +206,7 @@ is</p>
 <em>every</em> sub-module, so all 48 linear-attention layers take the slow path — including the 56 frozen blocks below
 the LoRA layers that never need a gradient.</p>
 {fig(F["patch"], "The patch. Gradients only have to flow through the lowest LoRA layer and above, so frozen layers can "
-     "stay on the non-differentiable kernel — the same idea as wrapping frozen layers in <code>no_grad</code> in PyTorch.", 2)}
+     "stay on the non-differentiable kernel — the same idea as wrapping frozen layers in <code>no_grad</code> in PyTorch.", 3)}
 <p><code>mlx_train.py</code> intercepts <code>GatedDeltaNet._set_training_mode</code> so marked frozen layers stay at
 <code>training=False</code>, then calls the stock <code>mlx_lm lora</code> entry point with identical CLI arguments.
 It refuses to start unless three self-checks pass: the mlx-lm version is on an allow-list, the upstream line above
@@ -170,19 +219,47 @@ still exists, and after patching the per-layer training flags are what we expect
 <p class="small">Train/val loss at step 8 were bit-identical with and without the patch (2.709 / 2.035) — checked on one
 configuration for 8 steps.</p>
 
-<h2 id="memory">3. Memory: a self-correction</h2>
+<h2 id="memory">3. Memory: a self-correction, then the real fix</h2>
 <p>I initially reported that the patch cut memory from 83&nbsp;GB to 76&nbsp;GB. That number came from
 <code>/usr/bin/time -l</code>, i.e. the process footprint, which includes MLX's allocator cache. Re-measuring with
 MLX's own <code>mx.get_peak_memory()</code> on the 0.8B sibling model told a different story:</p>
 {fig(F["mem"], "Real peak memory grows roughly as T<sup>1.7</sup> with sequence length. LoRA layer count (4–24), rank "
-     "(16/64) and the patch all change the real peak by less than 2%. The footprint overstates it by 1.3–1.8×.", 3)}
+     "(16/64) and the patch all change the real peak by less than 2%. The footprint overstates it by 1.3–1.8×.", 4)}
 <p>With gradient checkpointing, the backward pass recomputes one block at a time, so the peak is set by the
 intermediate states of a single linear-attention loop — independent of how many layers take the slow path. The patch
 only removes the frozen layers' forward loops, which is why it buys 1.4–1.9× speed and no memory. On 27B, sequence 2048
-still OOMs; 1024 is the ceiling that drove most later choices (chunk length, DPO sequence length).</p>
-<p>The thorough fix is a differentiable fused kernel. unsloth-zoo merged one in July 2026 <a href="#r21">[21]</a>
-(self-reported ~9× faster, 1/5 peak memory on 128&nbsp;GB machines; I have not verified it). The two are complementary:
-the frozen-layer trick and a LoRA-layer kernel do not conflict.</p>
+still OOMs; 1024 is the ceiling that drove most of the experiments below (chunk length, DPO sequence length).</p>
+
+<h3>3.1 The thorough fix: a fused backward kernel</h3>
+<p>What the LoRA layers need is a differentiable kernel. unsloth-zoo merged one <a href="#r21">[21]</a>: it cuts the
+sequence into chunks of 64–512 steps, each wrapped in an <code>mx.custom_function</code>. The forward is a blocked
+Metal kernel; the backward first rebuilds each chunk&rsquo;s states with a checkpoint kernel, then runs one reverse
+scan. I did not take a dependency on unsloth. <code>fetch_gdn_kernel.py</code> downloads that one file at a pinned
+commit, checks its sha256 and puts it in a git-ignored <code>third_party/</code> (it is AGPL-3.0, so it is not
+vendored). <code>mlx_train.py</code> then routes only the training-mode call of <code>gated_delta_update</code> to it.
+Frozen layers stay on the inference kernel, so the two fixes stack. A fourth self-check compares the kernel&rsquo;s
+gradients with the ops path in fp32 on a small multi-chunk case and refuses to start above 10<sup>-4</sup> relative
+error. Without the file, it falls back to the ops path.</p>
+{fig(F["gdn_speed"], "Throughput on 27B (batch 1, gradient checkpointing, 4-bit base). The ops path at sequence "
+     "1024 / 8 layers is the better of two runs (33 and 39 tok/s). 2048 OOMs on the ops path; 4096 and 8192 were not "
+     "attempted there. Long-sequence rows use neutral long samples built from repository docs.", 5)}
+{fig(F["gdn_mem"], "Real peak memory (<code>mx.get_peak_memory()</code>) for the same runs. With the kernel the peak "
+     "is set by the weights plus a few GB and barely grows with sequence length: 17.3 → 27.5&nbsp;GB from 1024 to 8192 "
+     "tokens.", 6)}
+{fig(F["gdn_loss"], "Correctness: the first six SFT steps on the same data and seed. The two paths differ by at most "
+     "0.001; the lines overlap.", 7)}
+<p>The numbers hold up at the layer level too. Against an fp32 reference, both paths carry the same 2–4×10<sup>-3</sup>
+bf16 error, and whole-model LoRA gradients differ by 0.8% between them. DPO&rsquo;s step-4 loss is 1.6463 vs 1.6442.
+One layer&rsquo;s forward + backward at T = 1024 goes from 895&nbsp;ms to 12&nbsp;ms.</p>
+<p>Where the speed comes from is partly not the arithmetic. The ops path&rsquo;s autodiff graph is about T × 12
+primitives per layer, and <code>mx.compile</code> retraces it for every new padded length. On fixed-length data the
+ops path warms up to ~105 tok/s; on real variable-length data it stays at 80. The kernel turns each chunk into one
+graph node, so retracing is cheap. A pure forward pass now runs at ~190 tok/s, close to the M4 Max&rsquo;s compute
+limit, and a training step reaches about 70% of that.</p>
+<p>Things I tried on top that did not help: no gradient checkpointing (same 132 tok/s, 25.7&nbsp;GB), batch 2 (same
+tok/s), padding to multiples of 256 (162 → 149 tok/s on variable-length data), and running the frozen layers on
+unsloth&rsquo;s blocked forward too (0.41 → 0.20&nbsp;s for all 48 layers in isolation, under 2% per step, inside the
+noise). What is left is mostly 4-bit matmuls.</p>
 
 <h2 id="eval">4. What counts as "not refusing"?</h2>
 <p>Most of the mistakes I made were measurement mistakes.</p>
@@ -238,7 +315,7 @@ directions over matched prompt sets:</p>
 the two directions overlap — increasingly so in later layers:</p>
 {fig(F["cos"], "Cosine similarity between the target-category and general-harm directions, per layer. Near zero in the "
      "first third, ~0.3–0.5 in the middle, ~0.68 at the top: the deeper you go, the more 'refuse this category' and "
-     "'refuse harmful things' share one representation.", 4)}
+     "'refuse harmful things' share one representation.", 8)}
 <p>So the target direction is orthogonalised against the general-harm direction before use:</p>
 \\[ u = \\frac{{r^{{\\text{{harm}}}}_\\ell}}{{\\lVert r^{{\\text{{harm}}}}_\\ell\\rVert}},\\qquad
     r^{{\\perp}}_\\ell = r^{{\\text{{target}}}}_\\ell - \\left(r^{{\\text{{target}}}}_\\ell\\cdot u\\right)u,\\qquad
@@ -248,7 +325,7 @@ the two directions overlap — increasingly so in later layers:</p>
 \\([L/4, 3L/4]\\) in steps of 4 on 10 held-out target prompts:</p>
 {fig(F["sel"], "Layer sweep (keyword detector, 48 tokens, small held-out sets, so coarse). Solid: target-category "
      "refusal (lower is better). Dashed: share of harmful prompts still refused (higher is better). The plain direction "
-     "from layers 44–48 also releases harmful requests (dashed orange collapses); the orthogonalised one does not.", 5)}
+     "from layers 44–48 also releases harmful requests (dashed orange collapses); the orthogonalised one does not.", 9)}
 <table>
 <tr><th>method</th><th>target refusal</th><th>control</th><th>harmful (2 + 12)</th><th>training</th></tr>
 <tr><td>Base model</td><td>59%</td><td>0%</td><td>all refused</td><td>—</td></tr>
@@ -259,7 +336,7 @@ the two directions overlap — increasingly so in later layers:</p>
 
 <h2 id="deflect">7. The main finding: refusal ≠ deflection</h2>
 {fig(F["rdcu"], "Stacking LoRA and ablation nearly eliminates explicit refusals (43 → 1) but converts them into "
-     "deflections (0 → 18); the comply rate stays at 56%. DPO is the only intervention that lowers DEFLECT.", 6)}
+     "deflections (0 → 18); the comply rate stays at 56%. DPO is the only intervention that lowers DEFLECT.", 10)}
 <p>The direction controls whether the model <em>says no</em>. "Say yes, then quietly write a tamer version" is a
 separate behaviour that neither SFT nor ablation removes. Some details:</p>
 <ul>
@@ -287,9 +364,9 @@ chosen answer (<code>sft_alpha</code>, as in <a href="#r16">[16]</a>).</p>
     g_c = -\\beta\\,\\sigma(-\\beta\\Delta) - \\frac{{\\alpha}}{{|y_c|}},\\quad g_r = \\beta\\,\\sigma(-\\beta\\Delta) \\]
 {fig(F["dpo"], "Two-pass exact gradient. A no-grad forward gives the four log-probabilities, hence g<sub>c</sub> and "
      "g<sub>r</sub>; then each sequence is back-propagated alone and scaled. The reference log-probs are computed once "
-     "before training, so the reference model is never in memory.", 7)}
+     "before training, so the reference model is never in memory.", 11)}
 <p>The result matches direct autodiff (gradient cosine 0.99994). On 27B at sequence 1024 the MLX peak is
-34.7–36.5&nbsp;GB, ~31&nbsp;s per pair. Related decoupled-backward ideas: <a href="#r29">[29]</a><a href="#r30">[30]</a>.</p>
+34.7–36.5&nbsp;GB, ~31&nbsp;s per pair; with the §3.1 kernel it drops to 19.0&nbsp;GB and 70 → 102 tok/s. Related decoupled-backward ideas: <a href="#r29">[29]</a><a href="#r30">[30]</a>.</p>
 <h3>8.3 On-policy pairs</h3>
 <p>180 prompts (about 30% scripts / storyboards), each sampled 4 times (900 tokens) from the SFT checkpoint the DPO
 run starts from: 720 answers, judged COMPLY 366 / REFUSE 160 / DEFLECT 134 / UNCLEAR 60. For each prompt a COMPLY
@@ -319,7 +396,7 @@ and <em>re-quantises to 4-bit</em>. Affine 4-bit quantisation stores, per group 
 <p>so each weight can only move in steps of \\(s_g\\). The LoRA delta is 2–7% of the weight norm — smaller than that
 step — and is mostly rounded away:</p>
 {fig(F["requant"], "Why re-quantising erases a LoRA. A small delta rounds back to the same 4-bit level; an 8-bit grid "
-     "(16× finer) keeps it.", 8)}
+     "(16× finer) keeps it.", 12)}
 <table>
 <tr><th>export</th><th>LoRA layer precision</th><th>size</th><th>cos(actual Δ, LoRA Δ) per layer</th><th>rel. error</th><th>target refusal</th></tr>
 <tr><td>unfused (base + adapter)</td><td>separate</td><td>16 + 0.2 GB</td><td>1</td><td>0</td><td>23% (5/22)</td></tr>
@@ -349,7 +426,7 @@ draft model (byte-identical to the public draft weights). Measured on the fused 
 </ul>
 {fig(F["dflash"], "DFlash speed-up relative to plain decoding, non-thinking mode. Chinese fiction accepts only ~1.5 draft "
      "tokens on average, so verification cost cancels the gain; with thinking on (gsm8k) it reaches 2.05×. LoRA and DPO "
-     "did not reduce acceptance.", 9)}
+     "did not reduce acceptance.", 13)}
 
 <h2 id="bake">11. Baking the direction into the weights — and the gate that said no</h2>
 <p>An inference hook only works inside my own Python. To use the ablation in LM Studio or an agent, it has to live in
@@ -357,7 +434,7 @@ the weights. Only two kinds of modules ever <em>write</em> to the residual strea
 projection of each sub-layer. If none of them can write a \\(d\\)-component, the stream never contains one — which is
 exactly what the hook enforces.</p>
 {fig(F["writers"], "Residual-stream writers in this architecture: the embedding, plus per layer the attention / "
-     "DeltaNet output projection and the MLP down projection. The final norm and lm_head only read.", 10)}
+     "DeltaNet output projection and the MLP down projection. The final norm and lm_head only read.", 14)}
 \\[ E \\leftarrow E - (E d)\\,d^\\top \\qquad (E\\in\\mathbb{{R}}^{{V\\times D}}) \\]
 \\[ W \\leftarrow W - d\\,(d^\\top W) = (I - d d^\\top)\\,W \\qquad (W\\in\\mathbb{{R}}^{{D\\times d_{{in}}}}) \\]
 <p>In this model that is 129 matrices (embedding, 64 down projections, 16 attention <code>o_proj</code>, 48 DeltaNet
@@ -413,6 +490,8 @@ in "tamer versions"; it takes a contrast signal (DPO on your own deflections) to
 the adapter in the notebook.</li>
 <li>Measure memory with the framework's real peak; process footprint includes caches and will flatter your
 optimisation.</li>
+<li>Benchmark speed on real, variable-length data. Fixed-length benchmarks hide compile retracing: the same ops path
+ran at 105 tok/s on fixed lengths and 80 on the real data.</li>
 <li>In DPO, watch r<sub>c</sub>. When the chosen answer's implicit reward goes negative, the model is winning by
 pushing everything down.</li>
 <li>Deployment defaults silently change behaviour: thinking mode, temperature, system prompts, cached templates,
