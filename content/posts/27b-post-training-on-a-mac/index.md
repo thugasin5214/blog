@@ -13,17 +13,9 @@ I’m a strong believer in open-weight models. As LLMs get more capable, safety 
 
 Local models still can’t match frontier models in general capability. For a specific task, though, they’re often good enough. When they aren’t, you need a way to train them until they do what you expect. That’s what I love about open source: I can see how everything works, and I can retrain the model for what I need. I want a model that works for me, not for someone else’s policy. So I spent a few weeks finding out how far I could move a local Qwen3.8-27B away from refusing one specific category of requests. I also wanted to see what that costs in quality and in the safety behaviour I wanted to keep.
 
-> [!lede]
-> This is a write-up of a few weeks of post-training a 27-billion-parameter model on a single Mac (M4 Max, 128&nbsp;GB unified memory) with nothing but the open-source MLX stack. The goal was narrow: make the model stop refusing *one specific content category* while it keeps refusing everything else, then ship the result to a local runtime (LM Studio) and a local agent. The interesting parts turned out to be less about the goal and more about what broke along the way.
+This article describes how I made the model stop refusing one specific content category while it keeps refusing everything else, and then shipped it to a local runtime so I can use it with my local agent, all on my own machine (Mac Studio, M4 Max, 128&nbsp;GB).
 
-> [!tldr] TL;DR
-> - **Training a hybrid linear-attention model in MLX is slow for a fixable reason.** mlx-lm drops every Gated DeltaNet layer into a per-token Python loop in training mode, frozen layers included. A ~60-line patch keeps frozen layers on the Metal kernel: 32 → 61 tok/s. It does *not* save memory (I first thought it did; it was allocator cache). Swapping unsloth-zoo’s fused backward kernel into the LoRA layers does: 102 tok/s at 17&nbsp;GB instead of 58&nbsp;GB, and sequence 8192 now trains in 27.5&nbsp;GB, with identical loss.
-> - **Refusing and deflecting are different behaviours.** Stacking LoRA SFT with refusal-direction ablation took explicit refusals from 43/66 to 1/66, yet the comply rate did not move (56%): the refusals turned into "sure!"-and-then-write-something-else. Only DPO on the model's own deflections reduced them.
-> - **Fusing a LoRA into a 4-bit base erases it.** `mlx_lm fuse` re-quantises to 4-bit; the LoRA delta (2–7% of the weight norm) is below the 4-bit rounding step, so the fused model behaves like the base again (41% refusal vs 23% unfused). Saving only the LoRA layers at 8-bit fixes it for +2&nbsp;GB.
-> - **Baking the ablation into the weights works exactly** (KL to the hook version 0.0004) — and that is how I found out the direction also weakened a refusal it was never supposed to touch. The safety gate blocked the export. Orthogonalising against "general harm" is not enough; protected categories need their own constraint.
-
-> [!note]
-> A note on scope. The target category was consensual fiction between adults, which mainstream instruct models refuse by default. Nothing below shows any generated text, training sample or concrete prompt from that category; everything is reported as rates and label counts. The data pipeline hard-filters anything involving minors (no switch to turn it off), and every configuration is evaluated on other harmful requests that must stay refused. I refer to the target simply as **the target category** from here on.
+I ended up trying two approaches: post-training and refusal-direction ablation. The code and notebooks for both are on GitHub: [thugasin5214/mlx-post-training](https://github.com/thugasin5214/mlx-post-training).
 
 [TOC]
 
@@ -32,28 +24,26 @@ Local models still can’t match frontier models in general capability. For a sp
 
 ## 1. Setup and constraints {#setup}
 
-- **Hardware.** One Mac Studio, M4 Max, 128&nbsp;GB unified memory. No CUDA, so MLX (`mlx 0.32.4`, `mlx-lm 0.32.2`).
-- **Model.** `mlx-community/Qwen3.8-27B-4bit` (16&nbsp;GB, affine 4-bit, group size 64). It is a hybrid: of 64 layers, 48 use Gated DeltaNet linear attention [[10]](#r10)[[11]](#r11) and 16 use full (gated) attention [[12]](#r12).
+- **Hardware.** I use GPUs for inference and training a lot at work, but I don't own one at home. As a big Apple fan I still enjoy my Mac Studio, and that comes with a big constraint: no CUDA. So MLX it is (`mlx 0.32.4`, `mlx-lm 0.32.2`).
+- **Model.** `mlx-community/Qwen3.8-27B-4bit` (16&nbsp;GB, affine 4-bit, group size 64). It is a hybrid: of 64 layers, 48 use Gated DeltaNet linear attention [[10]](#r10)[[11]](#r11) and 16 use full (gated) attention [[12]](#r12). It is also my main local model. I switched to it from a 4-bit Qwen 122B after measuring several local tasks with my own benchmarks; it is a great model and the best choice for me.
 - **Data.** A public Chinese fiction corpus in the target category (~45k stories). Ten sub-categories whose theme involves minors, incest, non-consent or real people were dropped wholesale; every remaining story then went through a keyword filter (minors: hard, cannot be disabled; non-consent and real people: on by default), de-duplication and chunking into ~1,100-character "opening + continuation" pairs. The main runs used 2,000 of the 16,118 resulting samples with diversified prompt phrasings.
 - **Evaluation set.** 22 target-category prompts (deliberately phrased unlike the training template), 8 control prompts (ordinary questions — must be answered), 2 + 12 harmful prompts from other categories (weapons, intrusion, poisons… — must be refused). No overlap with the DPO prompts (asserted in code).
 - **Training recipe.** QLoRA-style [[1]](#r1)[[2]](#r2): frozen 4-bit base, LoRA rank 16 (mlx scale 20) on all linear layers of the top 8 blocks, AdamW [[4]](#r4), lr 2e-5 cosine [[5]](#r5), gradient checkpointing [[6]](#r6), sequence length 1024, batch 1 × accumulation 4, loss on the response only.
 
 ## 2. Training Gated DeltaNet in MLX {#infra}
 
-### 2.1 What Gated DeltaNet is
+![Qwen3.8-27B architecture and one Gated DeltaNet layer](figures/arch.svg)
+*Qwen3.8-27B, drawn from its `config.json` and mlx-lm’s `qwen3_5.py`. Left: 64 layers in 16 groups of three Gated DeltaNet layers plus one gated full-attention layer, each followed by a dense SwiGLU MLP. Right: one Gated DeltaNet mixer. Keys and queries have 16 heads; values have 48, so three value heads share each key head. The state is 48 × 128 × 128 per layer regardless of context length.*
 
-A standard attention layer keeps every past key and value (the KV cache) and compares each new query with all of them, so cost and memory grow with context length. Linear attention replaces the cache with a fixed-size matrix $S$ per head, a running memory that maps keys to values: reading is $o_t = S_t q_t$, and writing adds $v_t k_t^\top$. Decoding then costs the same at token 100 and at token 100,000.
+Unlike a standard Transformer, Qwen3.8-27B combines Gated DeltaNet layers with full-attention layers. A standard attention layer keeps every past key and value (the KV cache) and compares each new query with all of them, so cost and memory grow with context length. Linear attention replaces the cache with a fixed-size matrix $S$ per head, a running memory that maps keys to values: reading is $o_t = S_t q_t$, and writing adds $v_t k_t^\top$. Decoding then costs the same at token 100 and at token 100,000.
 
 Plain additive writes pile up and blur, though. Gated DeltaNet [[10]](#r10) fixes this with two ideas. The **delta rule** first reads what $S$ currently stores under $k_t$, then writes only the correction $\beta_t (v_t - S k_t)$, so a key that is reused gets overwritten instead of accumulated. The **gate** $\alpha_t \in (0, 1)$, computed per token and per head, lets the layer decay old memory quickly (a topic change) or keep it (a long quote). Both $\alpha_t$ and the write strength $\beta_t$ come from small projections of the input, and a width-4 causal convolution in front gives $q, k, v$ some local context.
 
 A fixed-size memory is lossy, so it is weak at exact recall over long distances. Qwen3.8 therefore interleaves: three Gated DeltaNet layers, then one full (gated) attention layer, repeated 16 times.
 
-![Qwen3.8-27B architecture and one Gated DeltaNet layer](figures/arch.svg)
-*Qwen3.8-27B, drawn from its `config.json` and mlx-lm’s `qwen3_5.py`. Left: 64 layers in 16 groups of three Gated DeltaNet layers plus one gated full-attention layer, each followed by a dense SwiGLU MLP. Right: one Gated DeltaNet mixer. Keys and queries have 16 heads; values have 48, so three value heads share each key head. The state is 48 × 128 × 128 per layer regardless of context length.*
+### 2.1 Why it trains slowly in MLX
 
-### 2.2 Why it trains slowly in MLX
-
-The first 27B run (sequence 2048, 16 LoRA layers) died on step one with a Metal OOM at 122&nbsp;GB — for a 16&nbsp;GB model. The cause is one line in mlx-lm's `qwen3_5.py`:
+My first SFT job (sequence 2048, 16 LoRA layers) died on step one with a Metal OOM at 122&nbsp;GB — for a 16&nbsp;GB model. The cause is one line in mlx-lm's `qwen3_5.py`:
 
 ```python
 out, state = gated_delta_update(..., use_kernel=not self.training)
@@ -80,12 +70,7 @@ and the loop materialises every $S_t$ for autograd. The catch: `model.train()` r
 > [!small]
 > Train/val loss at step 8 were bit-identical with and without the patch (2.709 / 2.035) — checked on one configuration for 8 steps.
 
-## 3. Memory: a self-correction, then the real fix {#memory}
-
-I initially reported that the patch cut memory from 83&nbsp;GB to 76&nbsp;GB. That number came from `/usr/bin/time -l`, i.e. the process footprint, which includes MLX's allocator cache. Re-measuring with MLX's own `mx.get_peak_memory()` on the 0.8B sibling model told a different story:
-
-![Peak memory vs sequence length, 0.8B model](figures/mem.svg)
-*Real peak memory grows roughly as T<sup>1.7</sup> with sequence length. LoRA layer count (4–24), rank (16/64) and the patch all change the real peak by less than 2%. The footprint overstates it by 1.3–1.8×.*
+## 3. Memory: what the patch does not fix {#memory}
 
 With gradient checkpointing, the backward pass recomputes one block at a time, so the peak is set by the intermediate states of a single linear-attention loop — independent of how many layers take the slow path. The patch only removes the frozen layers' forward loops, which is why it buys 1.4–1.9× speed and no memory. On 27B, sequence 2048 still OOMs; 1024 is the ceiling that drove most of the experiments below (chunk length, DPO sequence length).
 
@@ -99,18 +84,9 @@ What the LoRA layers need is a differentiable kernel. unsloth-zoo merged one [[2
 ![Real peak memory on 27B, ops path vs fused kernel](figures/gdn-mem.svg)
 *Real peak memory (`mx.get_peak_memory()`) for the same runs. With the kernel the peak is set by the weights plus a few GB and barely grows with sequence length: 17.3 → 27.5&nbsp;GB from 1024 to 8192 tokens.*
 
-![Training loss, ops path vs fused kernel, same data and seed](figures/gdn-loss.svg)
-*Correctness: the first six SFT steps on the same data and seed. The two paths differ by at most 0.001; the lines overlap.*
-
-The numbers hold up at the layer level too. Against an fp32 reference, both paths carry the same 2–4×10<sup>-3</sup> bf16 error, and whole-model LoRA gradients differ by 0.8% between them. DPO’s step-4 loss is 1.6463 vs 1.6442. One layer’s forward + backward at T = 1024 goes from 895&nbsp;ms to 12&nbsp;ms.
-
 Where the speed comes from is partly not the arithmetic. The ops path’s autodiff graph is about T × 12 primitives per layer, and `mx.compile` retraces it for every new padded length. On fixed-length data the ops path warms up to ~105 tok/s; on real variable-length data it stays at 80. The kernel turns each chunk into one graph node, so retracing is cheap. A pure forward pass now runs at ~190 tok/s, close to the M4 Max’s compute limit, and a training step reaches about 70% of that.
 
-Things I tried on top that did not help: no gradient checkpointing (same 132 tok/s, 25.7&nbsp;GB), batch 2 (same tok/s), padding to multiples of 256 (162 → 149 tok/s on variable-length data), and running the frozen layers on unsloth’s blocked forward too (0.41 → 0.20&nbsp;s for all 48 layers in isolation, under 2% per step, inside the noise). What is left is mostly 4-bit matmuls.
-
 ## 4. What counts as "not refusing"? {#eval}
-
-Most of the mistakes I made were measurement mistakes.
 
 ### 4.1 The keyword regex under-counted refusals — three times
 
@@ -118,7 +94,7 @@ The first detector was a keyword regex over the first 300 characters. Manual spo
 
 ### 4.2 A four-label judge
 
-`judge.py` asks the 27B base model (greedy) to label each answer:
+The judge asks the 27B base model (greedy) to give each answer one of four labels:
 
 <ul class="labels">
 <li><span class="tag r">REFUSE</span> explicit refusal</li>
@@ -189,7 +165,7 @@ At inference a hook removes $d$ from the input of layer 0 and from the output of
 | Ablation orth@24 | **18%** | 0% | all refused (judge 12/12) | none |
 | Ablation plain, late layers | — | — | harmful released too | none |
 
-## 7. The main finding: refusal ≠ deflection {#deflect}
+## 7. Refusal ≠ deflection {#deflect}
 
 ![Judge labels per intervention, 66 long generations each](figures/rdcu.svg)
 *Stacking LoRA and ablation nearly eliminates explicit refusals (43 → 1) but converts them into deflections (0 → 18); the comply rate stays at 56%. DPO is the only intervention that lowers DEFLECT.*
@@ -343,7 +319,9 @@ An ablation that lives in the weights is attractive here precisely because it do
 - **No capability benchmarks.** Only 8 control prompts check that nothing broke; no MMLU / C-Eval / writing-quality evaluation. This is the largest gap.
 - **Keyword safety filter.** It cannot catch non-consent that is only implied by the narrative. Any release of data or weights would need a classifier pass. I release neither.
 - **One model, one quantisation** (affine 4-bit, group 64).
-- **Dual use.** Refusal-direction ablation can equally be used to release harmful categories. The orthogonalisation, the always-evaluated harmful set and the export gate exist to keep changes inside the target category — and §11 shows that even this is not sufficient by default. No direction, adapter or modified weights are published.
+- **Dual use.** Refusal-direction ablation can equally be used to release harmful categories. The orthogonalisation, the always-evaluated harmful set and the export gate exist to keep changes inside the target category — and §11 shows that even this is not sufficient by default. No direction, adapter, prompt set or modified weights are published; the [code](https://github.com/thugasin5214/mlx-post-training) is, with the minors filter and the export gate built in.
+
+Still, I'm very happy with where this ended up: I now have a local model that fits my current use cases, and a clear path forward for future requirements. It is my go-to local model now, and everything about it is under my control.
 
 ## References {#refs}
 
