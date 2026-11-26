@@ -1,0 +1,6 @@
+# Site-wide settings used by tools/build.py and the templates.
+title: thugasin5214 / blog
+author: thugasin5214
+description: Notes on training and running models locally.
+date_format: "%B %Y"          # how post dates are shown (strftime)
+footer: "Text CC BY 4.0. No model weights, adapters, directions or datasets are distributed here."

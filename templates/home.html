@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block main %}
+<h1>{{ site.title }}</h1><p class="sub">{{ site.description }}</p>
+<ul class="post-list">
+{% for p in posts %}
+<li><a href="posts/{{ p.slug }}/">{{ p.title }}</a>{% if p.subtitle %}<p>{{ p.subtitle }}</p>{% endif %}
+<p>{{ p.date | date }}{% if p.draft %} · draft{% endif %}</p></li>
+{% endfor %}
+</ul>
+{% endblock %}

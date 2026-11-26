@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}{{ post.title }} — {{ site.author }}{% endblock %}
+{% block description %}{{ post.description or post.subtitle or "" }}{% endblock %}
+{% block meta %}
+{% if post.tags %}<meta name="keywords" content="{{ post.tags | join(', ') }}">{% endif %}
+<meta property="og:title" content="{{ post.title }}">
+<meta property="og:description" content="{{ post.description or post.subtitle or '' }}">
+<meta property="og:type" content="article">
+{% endblock %}
+{% block head %}
+<link rel="stylesheet" href="{{ root }}assets/pygments.css">
+{% if post.math %}
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/contrib/auto-render.min.js"
+ onload="renderMathInElement(document.body,{delimiters:[{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}]})"></script>
+{% endif %}
+{% if post.mermaid %}
+<script type="module">
+import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs";
+const t = document.documentElement.dataset.theme;
+const dark = t ? t === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+mermaid.initialize({startOnLoad: true, theme: dark ? "dark" : "neutral"});
+</script>
+{% endif %}
+{% endblock %}
+{% block main %}
+<h1>{{ post.title }}</h1>
+{% if post.subtitle %}<p class="sub">{{ post.subtitle }}</p>{% endif %}
+<div class="meta">{{ post.author or site.author }} · {{ post.date | date }} · ~{{ post.minutes }} min read{% if post.draft %} · <b>draft</b>{% endif %}</div>
+{{ post.body | safe }}
+{% endblock %}
