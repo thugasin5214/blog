@@ -27,6 +27,6 @@ mermaid.initialize({startOnLoad: true, theme: dark ? "dark" : "neutral"});
 {% block main %}
 <h1>{{ post.title }}</h1>
 {% if post.subtitle %}<p class="sub">{{ post.subtitle }}</p>{% endif %}
-<div class="meta">{{ post.author or site.author }} · {{ post.date | date }} · ~{{ post.minutes }} min read{% if post.draft %} · <b>draft</b>{% endif %}</div>
+{% if post.draft %}<div class="meta"><b>draft</b></div>{% endif %}
 {{ post.body | safe }}
 {% endblock %}
